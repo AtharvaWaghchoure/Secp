@@ -1,0 +1,4 @@
+[sncast.sepolia]
+url = "https://api.cartridge.gg/x/starknet/sepolia"
+accounts-file = "/home/atharva/.starkli-wallets/sepolia-accounts.json"
+account = "deployer"
