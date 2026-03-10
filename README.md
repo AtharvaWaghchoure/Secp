@@ -2,19 +2,21 @@
 
 > Your Bitcoin key. Your Starknet account. Your privacy.
 
-A Starknet smart account controlled entirely by a Bitcoin secp256k1 key — with stealth addresses for private payments and a live DeFi swap demo.
+A Starknet smart account controlled entirely by a Bitcoin secp256k1 key with stealth addresses for private payments and a live DeFi swap demo.
 
 No new seed phrases. No bridges. No custodians.
 
 Built for the **Re{define} Hackathon 2026** — Privacy & Bitcoin on Starknet track.
 
+**[Demo & Pitch Playlist](https://www.youtube.com/playlist?list=PLCiZws7IzuY8_tCn816EsQMISRCwKI34R)**
+
 ---
 
 ## What it does
 
-Every Bitcoin wallet holds a secp256k1 keypair. This project makes that keypair the sole authority over a Starknet smart account. Connect Xverse, get a Starknet address, deploy it, and start using Starknet DeFi — all signed with the key you already own.
+Every Bitcoin wallet holds a secp256k1 keypair. This project makes that keypair the sole authority over a Starknet smart account. Connect Xverse, get a Starknet address, deploy it, and start using Starknet DeFi all signed with the key you already own.
 
-On top of that: **stealth addresses**. Send STRK to someone privately. Nobody watching the chain can link the payment to the recipient. The recipient scans a public on-chain registry to find payments directed at them, derives a one-time claim key, and sweeps the funds — all without a new seed phrase.
+On top of that: **stealth addresses**. Send STRK to someone privately. Nobody watching the chain can link the payment to the recipient. The recipient scans a public on-chain registry to find payments directed at them, derives a one-time claim key, and sweeps the funds all without a new seed phrase.
 
 ---
 
@@ -175,11 +177,11 @@ bitcoin_starknet_account/
 
 ## Deployed contracts (Sepolia)
 
-| Contract | Address |
-|---|---|
-| BitcoinAccount class | `0x1c5e4906e319a5c79c3ead6f16c395106c8241cb5fd508a07e78fb3a656aacc` |
-| StealthRegistry | `0x02793374add811d87ecebd2308ba2bdd9c4a608376b25d960b84bbe0d7d2d4a5` |
-| RPC | `https://api.cartridge.gg/x/starknet/sepolia` |
+| Contract             | Address                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| BitcoinAccount class | `0x1c5e4906e319a5c79c3ead6f16c395106c8241cb5fd508a07e78fb3a656aacc`  |
+| StealthRegistry      | `0x02793374add811d87ecebd2308ba2bdd9c4a608376b25d960b84bbe0d7d2d4a5` |
+| RPC                  | `https://api.cartridge.gg/x/starknet/sepolia`                        |
 
 ---
 
@@ -222,7 +224,7 @@ and fund that address with STRK from the [Sepolia faucet](https://starknet-fauce
 ## Key design decisions
 
 **Why the Bitcoin message prefix?**
-Bitcoin wallets cannot sign raw bytes — they always apply `"\x18Bitcoin Signed Message:\n"` + length. Matching this in Cairo means any standard Bitcoin wallet (Xverse, Leather, etc.) works without modifications, and the signature scheme is identical to what users already trust for Bitcoin message signing.
+Bitcoin wallets cannot sign raw bytes they always apply `"\x18Bitcoin Signed Message:\n"` + length. Matching this in Cairo means any standard Bitcoin wallet (Xverse, Leather, etc.) works without modifications, and the signature scheme is identical to what users already trust for Bitcoin message signing.
 
 **Why secp256k1 and not the Stark curve?**
 Bitcoin keys live on secp256k1. Starknet natively provides a `secp256k1` ECDSA syscall (`is_valid_signature::<Secp256k1Point>`), making on-chain verification practical without ZK proofs or precompiles.
@@ -231,13 +233,13 @@ Bitcoin keys live on secp256k1. Starknet natively provides a `secp256k1` ECDSA s
 `starknet.js` returns tx hashes without leading zeros (e.g. `"0x1abc"`). Cairo's `bitcoin_message_hash` encodes the felt252 as `"0x" + 64 hex chars` — 66 characters, varint `0x42`. A shorter string changes the varint, producing a different double-SHA256 hash and an invalid signature. `XverseSigner._signHash` zero-pads to 64 chars to match exactly.
 
 **Why stealth addresses instead of just sending to a known address?**
-Sending STRK directly to a recipient's derived Starknet address is permanently linkable — anyone can map Bitcoin pubkey → Starknet address. Stealth addresses break this: each payment goes to a fresh address derived via ECDH. Only the recipient (with their private key) can scan and claim. The sender publishes an ephemeral public key to `StealthRegistry`; nobody else can derive the connection.
+Sending STRK directly to a recipient's derived Starknet address is permanently linkable anyone can map Bitcoin pubkey → Starknet address. Stealth addresses break this: each payment goes to a fresh address derived via ECDH. Only the recipient (with their private key) can scan and claim. The sender publishes an ephemeral public key to `StealthRegistry`; nobody else can derive the connection.
 
 **Why RawSecp256k1Signer for claiming?**
 Claiming a stealth payment requires signing with `sk_stealth = (sk_recipient + h) mod n`, a derived key that lives nowhere in any wallet. Xverse can't sign with it. `RawSecp256k1Signer` implements the same `SignerInterface` as `XverseSigner` but computes the Bitcoin message hash locally and signs with `@noble/curves secp256k1.sign(..., { prehash: false })`. The private key is computed in memory and never persisted.
 
 **Why a separate StealthRegistry contract instead of events on BitcoinAccount?**
-The account contract only knows about its own transfers — it has no way to attach metadata to transfers to other addresses. A standalone registry lets any sender announce any stealth payment, and any recipient scan all announcements from a single contract, regardless of which account sent the funds.
+The account contract only knows about its own transfers it has no way to attach metadata to transfers to other addresses. A standalone registry lets any sender announce any stealth payment, and any recipient scan all announcements from a single contract, regardless of which account sent the funds.
 
 **Why 20× gas boost?**
-`estimateInvokeFee` uses `skipValidate=true` — it never runs `__validate__`. The double SHA256 + secp256k1 verify costs ~3M l2_gas that the estimate misses. The 20× multiplier is conservative; `max_amount` is a cap in V3 transactions — users pay only for gas actually consumed.
+`estimateInvokeFee` uses `skipValidate=true` — it never runs `__validate__`. The double SHA256 + secp256k1 verify costs ~3M l2_gas that the estimate misses. The 20× multiplier is conservative; `max_amount` is a cap in V3 transactions users pay only for gas actually consumed.
