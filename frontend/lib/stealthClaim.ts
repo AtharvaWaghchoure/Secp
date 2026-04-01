@@ -44,11 +44,17 @@ import {
   buildConstructorCalldata,
   encodeSignatureAsCalldata,
   getStrkBalance,
+  isAccountDeployed,
   splitU256,
   parseStrkAmount,
   fetchAnnouncements,
   type OnChainAnnouncement,
 } from "./starknet";
+
+// Fixed additive gas overhead for __validate__ / __validate_deploy__.
+// Mirrors the same constant in starknet.ts — estimateFee skips validation
+// so the double-SHA256 + secp256k1 cost (~10-15M l2_gas) is never included.
+const VALIDATE_GAS_OVERHEAD = 50_000_000n;
 
 const SECP256K1_N =
   0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
@@ -227,7 +233,7 @@ export async function claimStealthPayment(
   const signer = new RawSecp256k1Signer(claimPrivkey);
   const account = new Account({ provider, address: stealthAddress, signer });
 
-  // ── 1. Deploy the stealth account ──────────────────────────────────────────
+  // ── 1. Deploy the stealth account (skip if already deployed) ───────────────
   const constructorCalldata = buildConstructorCalldata(
     stealthPubkeyX,
     stealthPubkeyY
@@ -238,42 +244,45 @@ export async function claimStealthPayment(
     "0x" + xHigh.toString(16)
   );
 
-  const deployPayload = {
-    classHash: BITCOIN_ACCOUNT_CLASS_HASH,
-    constructorCalldata,
-    addressSalt: salt,
-    contractAddress: stealthAddress,
-  };
+  let deployTx: string;
+  const alreadyDeployed = await isAccountDeployed(stealthAddress);
 
-  const deployEst = await account.estimateAccountDeployFee(deployPayload);
+  if (alreadyDeployed) {
+    deployTx = "(already deployed)";
+  } else {
+    const deployPayload = {
+      classHash: BITCOIN_ACCOUNT_CLASS_HASH,
+      constructorCalldata,
+      addressSalt: salt,
+      contractAddress: stealthAddress,
+    };
 
-  // 20× boost — same as the main account deploy in starknet.ts.
-  // __validate_deploy__ runs bitcoin_message_hash (double-SHA256) + secp256k1_verify,
-  // which skipValidate=true estimation misses entirely.
-  const deployL2Gas = BigInt(deployEst.resourceBounds.l2_gas.max_amount) * 20n;
+    const deployEst = await account.estimateAccountDeployFee(deployPayload);
 
-  // Pre-flight: sequencer rejects if max_amount × max_price > balance.
-  // Fail fast with a clear message rather than a cryptic RPC error.
-  const l2Price = BigInt(deployEst.resourceBounds.l2_gas.max_price_per_unit);
-  const l1DataCost =
-    BigInt(deployEst.resourceBounds.l1_data_gas.max_amount) *
-    BigInt(deployEst.resourceBounds.l1_data_gas.max_price_per_unit);
-  const deployMaxCost = deployL2Gas * l2Price + l1DataCost;
-  const SWEEP_RESERVE = parseStrkAmount("0.01");
-  const balanceWei = parseStrkAmount(payment.balance);
+    // Additive overhead: __validate_deploy__ runs bitcoin_message_hash (double-SHA256)
+    // + secp256k1_verify, which skipValidate=true estimation misses entirely.
+    const deployL2Gas =
+      BigInt(deployEst.resourceBounds.l2_gas.max_amount) + VALIDATE_GAS_OVERHEAD;
 
-  if (balanceWei < deployMaxCost + SWEEP_RESERVE) {
-    const needed = Number(deployMaxCost + SWEEP_RESERVE) / 1e18;
-    throw new Error(
-      `Need at least ${needed.toFixed(3)} STRK to claim at current gas prices ` +
-        `(${payment.balance} STRK in stealth address). ` +
-        `Top up ${stealthAddress} and scan again.`
-    );
-  }
+    // Pre-flight: sequencer rejects if max_amount × max_price > balance.
+    const l2Price = BigInt(deployEst.resourceBounds.l2_gas.max_price_per_unit);
+    const l1DataCost =
+      BigInt(deployEst.resourceBounds.l1_data_gas.max_amount) *
+      BigInt(deployEst.resourceBounds.l1_data_gas.max_price_per_unit);
+    const deployMaxCost = deployL2Gas * l2Price + l1DataCost;
+    const SWEEP_RESERVE = parseStrkAmount("0.01");
+    const balanceWei = parseStrkAmount(payment.balance);
 
-  const { transaction_hash: deployTx } = await account.deployAccount(
-    deployPayload,
-    {
+    if (balanceWei < deployMaxCost + SWEEP_RESERVE) {
+      const needed = Number(deployMaxCost + SWEEP_RESERVE) / 1e18;
+      throw new Error(
+        `Need at least ${needed.toFixed(3)} STRK to claim at current gas prices ` +
+          `(${payment.balance} STRK in stealth address). ` +
+          `Top up ${stealthAddress} and scan again.`
+      );
+    }
+
+    const { transaction_hash } = await account.deployAccount(deployPayload, {
       resourceBounds: {
         ...deployEst.resourceBounds,
         l2_gas: {
@@ -281,11 +290,12 @@ export async function claimStealthPayment(
           max_price_per_unit: deployEst.resourceBounds.l2_gas.max_price_per_unit,
         },
       },
-    }
-  );
+    });
+    deployTx = transaction_hash;
 
-  // Wait for deploy to land before the sweep invoke
-  await new Promise((resolve) => setTimeout(resolve, 10_000));
+    // Wait for deploy to land before the sweep invoke
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+  }
 
   // ── 2. Sweep remaining STRK → recipient ────────────────────────────────────
   const freshBalance = await getStrkBalance(stealthAddress);
@@ -311,9 +321,10 @@ export async function claimStealthPayment(
   ];
 
   const sweepEst = await account.estimateInvokeFee(sweepCalls);
-  // 3× is sufficient for the sweep — __validate__ is expensive but estimate is
-  // now done on a deployed account so it's more accurate than at deploy time.
-  const sweepL2Gas = BigInt(sweepEst.resourceBounds.l2_gas.max_amount) * 3n;
+  // Additive overhead — __validate__ costs the same fixed amount here as on
+  // any other invoke. The estimate still runs with skipValidate=true.
+  const sweepL2Gas =
+    BigInt(sweepEst.resourceBounds.l2_gas.max_amount) + VALIDATE_GAS_OVERHEAD;
 
   const { transaction_hash: sweepTx } = await account.execute(sweepCalls, {
     resourceBounds: {

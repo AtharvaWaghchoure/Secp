@@ -91,10 +91,13 @@ export async function POST(req: NextRequest) {
     };
 
     // Estimate fee — execute_from_outside runs bitcoin_message_hash + secp256k1 in
-    // execute phase so estimation captures the real cost. Use 3× boost for safety.
+    // the execute phase, but the relayer account uses a standard Stark signer so
+    // __validate__ on the relayer is cheap. The expensive secp256k1 work happens
+    // inside execute_from_outside (execute phase), which IS included in the estimate.
+    // Add a fixed 5M l2_gas buffer for safety.
     const estimate = await relayer.estimateInvokeFee([relayCall]);
     const boostedL2Gas =
-      BigInt(estimate.resourceBounds.l2_gas.max_amount) * 3n;
+      BigInt(estimate.resourceBounds.l2_gas.max_amount) + 10_000_000n;
 
     const tx = await relayer.execute([relayCall], {
       resourceBounds: {

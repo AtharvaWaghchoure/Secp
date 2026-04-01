@@ -96,7 +96,7 @@ export default function SignDemo({ wallet, starknetAddress }: Props) {
           <h2 className="text-xs font-semibold uppercase tracking-widest text-yellow-400 mb-4">
             Claim Stealth Payments — Sweep to Your Address
           </h2>
-          <StealthClaim starknetAddress={starknetAddress} />
+          <StealthClaim starknetAddress={starknetAddress} wallet={wallet} />
         </div>
       )}
 

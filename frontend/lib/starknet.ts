@@ -25,6 +25,25 @@ import {
 } from "starknet";
 import { signWithXverse } from "./bitcoin";
 
+// ── Gas helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * estimateInvokeFee / estimateAccountDeployFee run with skipValidate=true,
+ * so they never price __validate__ / __validate_deploy__.
+ * bitcoin_message_hash (double SHA256) + secp256k1_verify together consume a
+ * fixed ~10–15M l2_gas that the estimate misses entirely.
+ *
+ * We add a fixed additive overhead rather than a multiplier so that small
+ * execute payloads (e.g. a simple transfer) don't produce a max_amount that is
+ * still below the validation cost.  max_amount is a cap in V3 txs — the user
+ * only pays for gas actually consumed.
+ */
+const VALIDATE_GAS_OVERHEAD = 50_000_000n;
+
+function boostL2Gas(estimatedMaxAmount: bigint): bigint {
+  return estimatedMaxAmount + VALIDATE_GAS_OVERHEAD;
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 // Starknet Sepolia testnet (public endpoint by Cartridge)
@@ -306,7 +325,7 @@ export async function deployBitcoinAccount(
   // In V3 txs, max_amount is a cap — the user only pays for gas actually consumed, not the full cap.
   const estimate = await account.estimateAccountDeployFee(payload);
   const estimatedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount);
-  const boostedL2Gas = estimatedL2Gas * 20n;
+  const boostedL2Gas = boostL2Gas(estimatedL2Gas);
 
   const { transaction_hash } = await account.deployAccount(payload, {
     resourceBounds: {
@@ -369,7 +388,7 @@ export async function sendStrk(
   // Boost l2_gas.max_amount by 20× to cover validation.
   // In V3 txs, max_amount is a cap; the user only pays for gas actually consumed.
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -460,7 +479,7 @@ export async function announceOnChain(
   ];
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -552,7 +571,7 @@ export async function executeSwap(
   }));
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -654,7 +673,7 @@ export async function lockCollateral(
   ];
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -699,7 +718,7 @@ export async function borrowStrk(
   ];
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -758,7 +777,7 @@ export async function repayStrk(
   ];
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -819,7 +838,7 @@ export async function executeCalls(
   const account = new Account({ provider, address: starknetAddress, signer });
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
@@ -884,7 +903,7 @@ export async function depositToPool(
   ];
 
   const estimate = await account.estimateInvokeFee(calls);
-  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+  const boostedL2Gas = boostL2Gas(BigInt(estimate.resourceBounds.l2_gas.max_amount));
 
   const { transaction_hash } = await account.execute(calls, {
     resourceBounds: {
