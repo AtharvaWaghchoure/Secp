@@ -6,13 +6,16 @@ import { getStrkBalance } from "@/lib/starknet";
 import SwapDemo from "./SwapDemo";
 import StealthSend from "./StealthSend";
 import StealthClaim from "./StealthClaim";
+import BTCCollateral from "./BTCCollateral";
+import PrivacyPool from "./PrivacyPool";
+import WalletConnectTab from "./WalletConnectTab";
 
 interface Props {
   wallet: BitcoinWallet;
   starknetAddress: string;
 }
 
-type Tab = "swap" | "stealth" | "claim";
+type Tab = "swap" | "stealth" | "claim" | "collateral" | "pool" | "wc";
 
 export default function SignDemo({ wallet, starknetAddress }: Props) {
   const [tab, setTab] = useState<Tab>("swap");
@@ -32,7 +35,7 @@ export default function SignDemo({ wallet, starknetAddress }: Props) {
 
       {/* Tab switcher */}
       <div className="flex gap-1 bg-slate-900 rounded-lg p-1">
-        {([["swap", "DeFi Swap"], ["stealth", "Stealth Send"], ["claim", "Claim"]] as [Tab, string][]).map(
+        {([["swap", "DeFi Swap"], ["stealth", "Stealth Send"], ["claim", "Claim"], ["collateral", "BTC Loan"], ["pool", "Pool"], ["wc", "WalletConnect"]] as [Tab, string][]).map(
           ([t, label]) => (
             <button
               key={t}
@@ -52,6 +55,15 @@ export default function SignDemo({ wallet, starknetAddress }: Props) {
               )}
               {t === "claim" && (
                 <span className="ml-1.5 text-yellow-400 text-xs">Receive</span>
+              )}
+              {t === "collateral" && (
+                <span className="ml-1.5 text-orange-400 text-xs">DeFi</span>
+              )}
+              {t === "pool" && (
+                <span className="ml-1.5 text-teal-400 text-xs">Shield</span>
+              )}
+              {t === "wc" && (
+                <span className="ml-1.5 text-blue-400 text-xs">SDK</span>
               )}
             </button>
           )
@@ -85,6 +97,36 @@ export default function SignDemo({ wallet, starknetAddress }: Props) {
             Claim Stealth Payments — Sweep to Your Address
           </h2>
           <StealthClaim starknetAddress={starknetAddress} />
+        </div>
+      )}
+
+      {/* ── BTC Collateral ── */}
+      {tab === "collateral" && (
+        <div className="border border-orange-900 rounded-xl p-4">
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-orange-400 mb-4">
+            BTC Collateral — Borrow STRK Against Bitcoin
+          </h2>
+          <BTCCollateral wallet={wallet} starknetAddress={starknetAddress} />
+        </div>
+      )}
+
+      {/* ── Privacy Pool ── */}
+      {tab === "pool" && (
+        <div className="border border-teal-900 rounded-xl p-4">
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-teal-400 mb-4">
+            Privacy Pool — Fixed-Denomination Shielded Transfers
+          </h2>
+          <PrivacyPool wallet={wallet} starknetAddress={starknetAddress} />
+        </div>
+      )}
+
+      {/* ── WalletConnect ── */}
+      {tab === "wc" && (
+        <div className="border border-blue-900 rounded-xl p-4">
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-blue-400 mb-4">
+            WalletConnect — Connect Any Starknet dApp
+          </h2>
+          <WalletConnectTab wallet={wallet} />
         </div>
       )}
     </div>

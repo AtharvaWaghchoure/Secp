@@ -11,6 +11,8 @@
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
+    "@walletconnect/core": "^2.23.9",
+    "@walletconnect/web3wallet": "^1.16.1",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",

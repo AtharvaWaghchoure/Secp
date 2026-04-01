@@ -31,9 +31,13 @@ import { signWithXverse } from "./bitcoin";
 export const STARKNET_RPC = "https://api.cartridge.gg/x/starknet/sepolia";
 
 // Class hash of the BitcoinAccount contract class declared on Sepolia.
-// Updated to include bitcoin_message_hash: tx 0x1094b7e8bdefac2c1cc74c05c9aff89b29b65a095c9f03d0398f77d8f5de88
+// v2: added execute_from_outside (gasless) + nonce tracking
 export const BITCOIN_ACCOUNT_CLASS_HASH =
-  "0x1c5e4906e319a5c79c3ead6f16c395106c8241cb5fd508a07e78fb3a656aacc";
+  "0x746a096f8edcb0db7155fd7711f7866a0727b1de7d902f316a1892ad3a28bb9";
+
+/** Deployed Secp256k1Paymaster contract — open relay for gasless transactions. */
+export const PAYMASTER_ADDRESS =
+  "0x07d0f833f2bbfac502255d5f1ef2277e2f57afeaee08bb0c69822861939d2a14";
 
 export const provider = new RpcProvider({ nodeUrl: STARKNET_RPC });
 
@@ -564,6 +568,459 @@ export async function executeSwap(
     transaction_hash,
     signedTxHash: signer.lastTxHash ?? transaction_hash,
     signature: signer.lastSignature ?? [],
+  };
+}
+
+// ── BTC Collateral ────────────────────────────────────────────────────────────
+
+/** Deployed BtcCollateral contract on Sepolia. */
+export const BTC_COLLATERAL_ADDRESS =
+  "0x006a7fd9126a8ed136e2ae325b8ba78ae628d7851a0e9285d52690f7023628ce";
+
+// Domain separator: 'btc_collateral_v1' as felt252 (ASCII big-endian)
+const BTC_COLLATERAL_DOMAIN = "0x6274635f636f6c6c61746572616c5f7631";
+
+// Price constant (matches contract): 5 × 10^15 STRK wei per satoshi
+const STRK_PER_SAT = 5_000_000_000_000_000n;
+
+export interface BTCPosition {
+  collateralSats: bigint;
+  debtStrk: bigint;
+  maxBorrow: bigint;
+  collateralValueStrk: bigint;
+  ltvPercent: number;
+}
+
+/**
+ * Compute the canonical hash for lock_collateral.
+ * Must match poseidon_hash_span(['btc_collateral_v1', caller, contract, sats, nonce]) in Cairo.
+ */
+export function hashCollateralLock(
+  starknetAddress: string,
+  sats: bigint,
+  nonce: bigint
+): string {
+  const elements = [
+    BTC_COLLATERAL_DOMAIN,
+    starknetAddress,
+    BTC_COLLATERAL_ADDRESS,
+    "0x" + sats.toString(16),
+    "0x" + nonce.toString(16),
+  ];
+  const result = hash.computePoseidonHashOnElements(elements);
+  return "0x" + BigInt(result).toString(16).padStart(64, "0");
+}
+
+/**
+ * Lock BTC collateral by proving ownership via Bitcoin secp256k1 signature.
+ * btcAmountBtc: decimal string e.g. "0.01"
+ */
+export async function lockCollateral(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  btcAmountBtc: string
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+  const sats = BigInt(Math.round(parseFloat(btcAmountBtc) * 1e8));
+  const nonce = BigInt(Date.now());
+
+  // Sign the commitment hash with Xverse
+  const commitHash = hashCollateralLock(starknetAddress, sats, nonce);
+  const { r, s } = await signWithXverse(bitcoinAddress, commitHash);
+  const signature = encodeSignatureAsCalldata(r, s);
+
+  const { low: xLow, high: xHigh } = splitU256(publicKeyX);
+  const { low: yLow, high: yHigh } = splitU256(publicKeyY);
+
+  const signer = new XverseSigner(bitcoinAddress);
+  const account = new Account({ provider, address: starknetAddress, signer });
+
+  const calls: Call[] = [
+    {
+      contractAddress: BTC_COLLATERAL_ADDRESS,
+      entrypoint: "lock_collateral",
+      calldata: [
+        "0x" + xLow.toString(16),
+        "0x" + xHigh.toString(16),
+        "0x" + yLow.toString(16),
+        "0x" + yHigh.toString(16),
+        "0x" + sats.toString(16), // u64 sats as felt252
+        "0x" + nonce.toString(16), // nonce felt252
+        "4", // Array<felt252> length
+        ...signature,
+      ],
+    },
+  ];
+
+  const estimate = await account.estimateInvokeFee(calls);
+  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+
+  const { transaction_hash } = await account.execute(calls, {
+    resourceBounds: {
+      ...estimate.resourceBounds,
+      l2_gas: {
+        max_amount: boostedL2Gas,
+        max_price_per_unit: estimate.resourceBounds.l2_gas.max_price_per_unit,
+      },
+    },
+  });
+
+  return {
+    transaction_hash,
+    signedTxHash: signer.lastTxHash ?? transaction_hash,
+    signature: signer.lastSignature ?? [],
+  };
+}
+
+/** Borrow STRK against locked BTC collateral (50% LTV enforced on-chain). */
+export async function borrowStrk(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  amountStrk: string
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+  const signer = new XverseSigner(bitcoinAddress);
+  const account = new Account({ provider, address: starknetAddress, signer });
+
+  const amount = parseStrkAmount(amountStrk);
+  const { low: amountLow, high: amountHigh } = splitU256(amount);
+
+  const calls: Call[] = [
+    {
+      contractAddress: BTC_COLLATERAL_ADDRESS,
+      entrypoint: "borrow_strk",
+      calldata: [
+        "0x" + amountLow.toString(16),
+        "0x" + amountHigh.toString(16),
+      ],
+    },
+  ];
+
+  const estimate = await account.estimateInvokeFee(calls);
+  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+
+  const { transaction_hash } = await account.execute(calls, {
+    resourceBounds: {
+      ...estimate.resourceBounds,
+      l2_gas: {
+        max_amount: boostedL2Gas,
+        max_price_per_unit: estimate.resourceBounds.l2_gas.max_price_per_unit,
+      },
+    },
+  });
+
+  return {
+    transaction_hash,
+    signedTxHash: signer.lastTxHash ?? transaction_hash,
+    signature: signer.lastSignature ?? [],
+  };
+}
+
+/**
+ * Repay borrowed STRK. Bundles approve + repay_strk into one multicall
+ * so the user only signs once.
+ */
+export async function repayStrk(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  amountStrk: string
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+  const signer = new XverseSigner(bitcoinAddress);
+  const account = new Account({ provider, address: starknetAddress, signer });
+
+  const amount = parseStrkAmount(amountStrk);
+  const { low: amountLow, high: amountHigh } = splitU256(amount);
+
+  const calls: Call[] = [
+    // 1. Approve the collateral contract to pull STRK
+    {
+      contractAddress: STRK_TOKEN,
+      entrypoint: "approve",
+      calldata: [
+        BTC_COLLATERAL_ADDRESS,
+        "0x" + amountLow.toString(16),
+        "0x" + amountHigh.toString(16),
+      ],
+    },
+    // 2. Repay
+    {
+      contractAddress: BTC_COLLATERAL_ADDRESS,
+      entrypoint: "repay_strk",
+      calldata: [
+        "0x" + amountLow.toString(16),
+        "0x" + amountHigh.toString(16),
+      ],
+    },
+  ];
+
+  const estimate = await account.estimateInvokeFee(calls);
+  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+
+  const { transaction_hash } = await account.execute(calls, {
+    resourceBounds: {
+      ...estimate.resourceBounds,
+      l2_gas: {
+        max_amount: boostedL2Gas,
+        max_price_per_unit: estimate.resourceBounds.l2_gas.max_price_per_unit,
+      },
+    },
+  });
+
+  return {
+    transaction_hash,
+    signedTxHash: signer.lastTxHash ?? transaction_hash,
+    signature: signer.lastSignature ?? [],
+  };
+}
+
+/** Fetch the current collateral position for a Starknet address. */
+export async function getBTCPosition(
+  starknetAddress: string
+): Promise<BTCPosition> {
+  const result = await provider.callContract({
+    contractAddress: BTC_COLLATERAL_ADDRESS,
+    entrypoint: "get_position",
+    calldata: [starknetAddress],
+  });
+
+  // Return: (u64 sats, u256 debt, u256 max_borrow, u256 collateral_value)
+  // Serialized: [sats, debt.low, debt.high, max.low, max.high, val.low, val.high] = 7 felts
+  const collateralSats = BigInt(result[0]);
+  const debtStrk = (BigInt(result[2]) << 128n) | BigInt(result[1]);
+  const maxBorrow = (BigInt(result[4]) << 128n) | BigInt(result[3]);
+  const collateralValueStrk = (BigInt(result[6]) << 128n) | BigInt(result[5]);
+
+  const ltvPercent =
+    collateralValueStrk === 0n
+      ? 0
+      : Number((debtStrk * 10000n) / collateralValueStrk) / 100;
+
+  return { collateralSats, debtStrk, maxBorrow, collateralValueStrk, ltvPercent };
+}
+
+// ── Generic call executor (used by WalletConnect) ─────────────────────────────
+
+/**
+ * Execute an arbitrary set of calls via the Bitcoin-keyed account.
+ * Used by WalletConnect to route dApp-initiated transactions through Xverse.
+ */
+export async function executeCalls(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  calls: Call[]
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+  const signer = new XverseSigner(bitcoinAddress);
+  const account = new Account({ provider, address: starknetAddress, signer });
+
+  const estimate = await account.estimateInvokeFee(calls);
+  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+
+  const { transaction_hash } = await account.execute(calls, {
+    resourceBounds: {
+      ...estimate.resourceBounds,
+      l2_gas: {
+        max_amount: boostedL2Gas,
+        max_price_per_unit: estimate.resourceBounds.l2_gas.max_price_per_unit,
+      },
+    },
+  });
+
+  return {
+    transaction_hash,
+    signedTxHash: signer.lastTxHash ?? transaction_hash,
+    signature: signer.lastSignature ?? [],
+  };
+}
+
+// ── Privacy Pool ──────────────────────────────────────────────────────────────
+
+/** Deployed PrivacyPool contract on Sepolia. */
+export const PRIVACY_POOL_ADDRESS =
+  "0x04cee13dde30159a3bb5c388ce7826cfa7d87ebb86dd7f5dc109d7c899c81570";
+
+/** Fixed denomination: 1 STRK = 10^18 wei. */
+const POOL_DENOMINATION = 10n ** 18n;
+
+/**
+ * Deposit 1 STRK into the PrivacyPool by committing a note.
+ * Bundles approve(pool, 1 STRK) + deposit(commitment) into one multicall.
+ * commitment: felt252 hex string (from generateNote().commitment)
+ */
+export async function depositToPool(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  commitment: string
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+  const signer = new XverseSigner(bitcoinAddress);
+  const account = new Account({ provider, address: starknetAddress, signer });
+
+  const { low: denomLow, high: denomHigh } = splitU256(POOL_DENOMINATION);
+
+  const calls: Call[] = [
+    // 1. Approve pool contract to pull 1 STRK
+    {
+      contractAddress: STRK_TOKEN,
+      entrypoint: "approve",
+      calldata: [
+        PRIVACY_POOL_ADDRESS,
+        "0x" + denomLow.toString(16),
+        "0x" + denomHigh.toString(16),
+      ],
+    },
+    // 2. Deposit and register commitment
+    {
+      contractAddress: PRIVACY_POOL_ADDRESS,
+      entrypoint: "deposit",
+      calldata: [commitment],
+    },
+  ];
+
+  const estimate = await account.estimateInvokeFee(calls);
+  const boostedL2Gas = BigInt(estimate.resourceBounds.l2_gas.max_amount) * 20n;
+
+  const { transaction_hash } = await account.execute(calls, {
+    resourceBounds: {
+      ...estimate.resourceBounds,
+      l2_gas: {
+        max_amount: boostedL2Gas,
+        max_price_per_unit: estimate.resourceBounds.l2_gas.max_price_per_unit,
+      },
+    },
+  });
+
+  return {
+    transaction_hash,
+    signedTxHash: signer.lastTxHash ?? transaction_hash,
+    signature: signer.lastSignature ?? [],
+  };
+}
+
+/** Check how many deposits have been made (anonymity set size). */
+export async function getPoolDepositCount(): Promise<number> {
+  try {
+    const result = await provider.callContract({
+      contractAddress: PRIVACY_POOL_ADDRESS,
+      entrypoint: "deposit_count",
+      calldata: [],
+    });
+    return Number(BigInt(result[0]));
+  } catch {
+    return 0;
+  }
+}
+
+// ── Gasless / execute_from_outside ────────────────────────────────────────────
+
+/**
+ * A call normalised for use with execute_from_outside.
+ * selector is the keccak entry-point selector (computed from entrypoint name).
+ */
+export interface NormalizedCall {
+  to: string;
+  selector: string;
+  calldata: string[];
+}
+
+// 'secp_outside_v1' encoded as a felt252 (ASCII big-endian, 15 bytes).
+// Must match the Cairo domain separator in hash_outside_execution().
+const OUTSIDE_EXEC_DOMAIN = "0x736563705f6f75747369645f7631";
+
+/**
+ * Compute the canonical hash of an execute_from_outside intent.
+ *
+ * Must produce the same value as account.cairo's hash_outside_execution().
+ *
+ *   poseidon(['secp_outside_v1', nonce, calls.len,
+ *             call0.to, call0.selector, poseidon(call0.calldata),
+ *             ...])
+ */
+export function hashOutsideExecution(
+  nonce: bigint,
+  calls: NormalizedCall[]
+): string {
+  const elements: string[] = [
+    OUTSIDE_EXEC_DOMAIN,
+    "0x" + nonce.toString(16),
+    "0x" + calls.length.toString(16),
+  ];
+
+  for (const call of calls) {
+    elements.push(call.to);
+    elements.push(call.selector);
+    // hash(calldata) — matches poseidon_hash_span(*call.calldata) in Cairo
+    const cdHash = hash.computePoseidonHashOnElements(call.calldata);
+    elements.push(cdHash.toString());
+  }
+
+  const result = hash.computePoseidonHashOnElements(elements);
+  return "0x" + BigInt(result).toString(16).padStart(64, "0");
+}
+
+/**
+ * Execute a swap gaslessly via the /api/relay endpoint.
+ *
+ * Flow:
+ *  1. Normalise AVNU calls (entrypoint → selector)
+ *  2. Compute calls hash (hashOutsideExecution)
+ *  3. Sign hash with Xverse (same Bitcoin message prefix as regular txs)
+ *  4. POST to /api/relay — backend submits using its funded relayer account
+ *  5. User pays zero STRK
+ */
+export async function executeGasless(
+  bitcoinAddress: string,
+  publicKeyX: bigint,
+  publicKeyY: bigint,
+  avnuCalls: AvnuCall[]
+): Promise<SendResult> {
+  const starknetAddress = deriveBitcoinAccountAddress(publicKeyX, publicKeyY);
+
+  // Normalise: resolve entrypoint name → selector
+  const normalized: NormalizedCall[] = avnuCalls.map((c) => ({
+    to: c.contractAddress,
+    selector: hash.getSelectorFromName(c.entrypoint),
+    calldata: c.calldata,
+  }));
+
+  // Timestamp-based nonce (unique per request, fits in felt252)
+  const nonce = BigInt(Date.now());
+
+  // Compute the intent hash the account will verify on-chain
+  const callsHashHex = hashOutsideExecution(nonce, normalized);
+
+  // Sign with Xverse — identical UX to a normal transaction signing
+  const { r, s } = await signWithXverse(bitcoinAddress, callsHashHex);
+  const signature = encodeSignatureAsCalldata(r, s);
+
+  // Submit via relay API (backend pays gas)
+  const resp = await fetch("/api/relay", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      userAddress: starknetAddress,
+      calls: normalized,
+      signature,
+      nonce: nonce.toString(),
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({ error: "Relay failed" }));
+    throw new Error(body.error ?? "Relay failed");
+  }
+
+  const { txHash } = await resp.json();
+  return {
+    transaction_hash: txHash,
+    signedTxHash: callsHashHex,
+    signature,
   };
 }
 

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import type { BitcoinWallet } from "@/lib/bitcoin";
 import { getSwapQuote, buildSwap, formatEth, type SwapQuote } from "@/lib/avnu";
-import { executeSwap, verifySignatureOnChain } from "@/lib/starknet";
+import { executeSwap, executeGasless, verifySignatureOnChain } from "@/lib/starknet";
 
 interface Props {
   wallet: BitcoinWallet;
@@ -14,6 +14,7 @@ type Phase = "input" | "quoted" | "swapping" | "verifying" | "done" | "error";
 
 export default function SwapDemo({ wallet, starknetAddress }: Props) {
   const [amount, setAmount] = useState("0.1");
+  const [gasless, setGasless] = useState(false);
   const [phase, setPhase] = useState<Phase>("input");
   const [quote, setQuote] = useState<SwapQuote | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
@@ -42,12 +43,9 @@ export default function SwapDemo({ wallet, starknetAddress }: Props) {
     setError(null);
     try {
       const calls = await buildSwap(quote.quoteId, starknetAddress);
-      const result = await executeSwap(
-        wallet.address,
-        wallet.publicKeyX,
-        wallet.publicKeyY,
-        calls
-      );
+      const result = gasless
+        ? await executeGasless(wallet.address, wallet.publicKeyX, wallet.publicKeyY, calls)
+        : await executeSwap(wallet.address, wallet.publicKeyX, wallet.publicKeyY, calls);
       setTxHash(result.transaction_hash);
       setPhase("verifying");
 
@@ -81,6 +79,28 @@ export default function SwapDemo({ wallet, starknetAddress }: Props) {
         <code className="text-slate-400">__validate__</code> verifies the
         secp256k1 signature on-chain before execution.
       </p>
+
+      {/* Gasless toggle */}
+      {(phase === "input" || phase === "error") && (
+        <div className="flex items-center justify-between bg-slate-900 border border-slate-700 rounded-lg px-3 py-2.5">
+          <div className="flex flex-col gap-0.5">
+            <span className="text-xs font-semibold text-slate-300">Gasless Mode</span>
+            <span className="text-xs text-slate-500">Relayer pays gas — you need zero STRK</span>
+          </div>
+          <button
+            onClick={() => setGasless((g) => !g)}
+            className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ${
+              gasless ? "bg-orange-500" : "bg-slate-600"
+            }`}
+          >
+            <span
+              className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform duration-200 ${
+                gasless ? "translate-x-4" : "translate-x-0"
+              }`}
+            />
+          </button>
+        </div>
+      )}
 
       {/* Step 1: amount input */}
       {(phase === "input" || phase === "error") && (
@@ -142,8 +162,8 @@ export default function SwapDemo({ wallet, starknetAddress }: Props) {
             className="w-full bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900 disabled:cursor-not-allowed text-white font-semibold py-2.5 rounded-lg text-sm transition-colors"
           >
             {phase === "swapping"
-              ? "Waiting for Xverse…"
-              : "Swap with Bitcoin Key"}
+              ? gasless ? "Submitting via relayer…" : "Waiting for Xverse…"
+              : gasless ? "Swap Gaslessly (sign intent)" : "Swap with Bitcoin Key"}
           </button>
 
           <button
@@ -170,6 +190,12 @@ export default function SwapDemo({ wallet, starknetAddress }: Props) {
             ✓ Swap Executed
           </h3>
 
+          {gasless && (
+            <div className="text-xs px-3 py-2 rounded-lg border bg-orange-950 border-orange-700 text-orange-300">
+              ✓ Gasless — sponsored by Secp relayer. You paid zero STRK.
+            </div>
+          )}
+
           {onChainVerified !== null && (
             <div
               className={`text-xs px-3 py-2 rounded-lg border ${
@@ -179,7 +205,7 @@ export default function SwapDemo({ wallet, starknetAddress }: Props) {
               }`}
             >
               {onChainVerified
-                ? "✓ __validate__ confirmed — secp256k1 signature verified on-chain"
+                ? "✓ execute_from_outside confirmed — secp256k1 verified on-chain"
                 : "⚠ On-chain check inconclusive (tx may still be pending)"}
             </div>
           )}
