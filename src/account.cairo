@@ -32,6 +32,19 @@ pub trait IBitcoinAccount<TState> {
     /// Rotate the key. Can only be called by the account itself (via __execute__).
     fn set_public_key(ref self: TState, new_x: u256, new_y: u256);
 
+    /// Execute calls on behalf of the account without requiring a full Starknet transaction
+    /// from the account itself. The caller (a relayer / paymaster) pays the gas.
+    ///
+    /// The user signs hash_outside_execution(nonce, calls) with their Bitcoin key,
+    /// and any relayer can submit this signed intent on-chain.
+    /// Each nonce can only be used once (replay protection).
+    fn execute_from_outside(
+        ref self: TState,
+        calls: Array<Call>,
+        signature: Array<felt252>,
+        nonce: felt252,
+    ) -> Array<Span<felt252>>;
+
     /// Off-chain view: verify whether a (hash, signature) pair is valid for this account.
     /// Returns VALIDATED on success, 0 on failure.
     fn is_valid_signature(self: @TState, hash: felt252, signature: Array<felt252>) -> felt252;
@@ -44,8 +57,9 @@ pub trait IBitcoinAccount<TState> {
 #[starknet::contract(account)]
 pub mod BitcoinAccount {
     use starknet::account::Call;
-    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess, Map, StorageMapReadAccess, StorageMapWriteAccess};
     use starknet::{get_caller_address, get_contract_address, get_tx_info};
+    use core::poseidon::poseidon_hash_span;
     use starknet::secp256k1::Secp256k1Point;
     use starknet::secp256_trait::{Secp256Trait, is_valid_signature};
     use starknet::SyscallResultTrait;
@@ -60,6 +74,8 @@ pub mod BitcoinAccount {
         public_key_x: u256,
         /// Bitcoin public key y-coordinate (secp256k1).
         public_key_y: u256,
+        /// Tracks used nonces for execute_from_outside (replay protection).
+        used_nonces: Map<felt252, bool>,
     }
 
     // ── Events ────────────────────────────────────────────────────────────────
@@ -161,6 +177,24 @@ pub mod BitcoinAccount {
             self.emit(PublicKeyChanged { old_x, new_x });
         }
 
+        fn execute_from_outside(
+            ref self: ContractState,
+            calls: Array<Call>,
+            signature: Array<felt252>,
+            nonce: felt252,
+        ) -> Array<Span<felt252>> {
+            // Replay protection: each nonce can only be used once.
+            assert(!self.used_nonces.read(nonce), 'Nonce already used');
+            self.used_nonces.write(nonce, true);
+
+            // Compute the canonical hash of this intent and apply the Bitcoin message prefix.
+            let calls_hash = hash_outside_execution(nonce, calls.span());
+            let msg_hash = bitcoin_message_hash(calls_hash);
+            assert(self._check_signature(msg_hash, signature.span()), 'Invalid outside sig');
+
+            _execute_calls(calls)
+        }
+
         fn is_valid_signature(
             self: @ContractState, hash: felt252, signature: Array<felt252>,
         ) -> felt252 {
@@ -216,6 +250,37 @@ pub mod BitcoinAccount {
 
             is_valid_signature::<Secp256k1Point>(hash, r, s, public_key)
         }
+    }
+
+    // ── Outside execution hash ────────────────────────────────────────────────
+
+    /// Compute the canonical hash for execute_from_outside.
+    ///
+    /// Hash structure (Poseidon over felt252 array):
+    ///   ['secp_outside_v1', nonce, calls.len, call0.to, call0.selector, hash(call0.calldata), ...]
+    ///
+    /// This must match hashOutsideExecution() in frontend/lib/starknet.ts.
+    fn hash_outside_execution(nonce: felt252, calls: Span<Call>) -> felt252 {
+        let mut data: Array<felt252> = array![
+            'secp_outside_v1', // domain separator
+            nonce,
+            calls.len().into(),
+        ];
+
+        let mut i: usize = 0;
+        loop {
+            if i >= calls.len() {
+                break;
+            }
+            let call = calls.at(i);
+            let to_felt: felt252 = (*call.to).into();
+            data.append(to_felt);
+            data.append(*call.selector);
+            data.append(poseidon_hash_span(*call.calldata));
+            i += 1;
+        };
+
+        poseidon_hash_span(data.span())
     }
 
     // ── Call execution ────────────────────────────────────────────────────────
